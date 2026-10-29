@@ -1,26 +1,29 @@
 # Beta updater
 
 Proposes a pull request against `beta` when QVAC publishes a newer, verified
-staging Flatpak. A human reviews and merges it. The updater never merges and
-never enables auto-merge. The production manifest on `master` is only read.
+staging Flatpak. A human reviews and merges it. The updater never merges, never
+enables auto-merge and never closes pull requests. The production manifest on
+`master` is only read.
 
 ## How it works
 
 `.github/workflows/beta-updater.yml` runs every 4 hours and on manual dispatch,
-from the default branch only. Code is taken from the trusted default-branch
-commit; the `beta` checkout is data (read as text, never executed or
-YAML-parsed). The only credential is the job's `GITHUB_TOKEN`
-(`contents: write`, `pull-requests: write`); no secrets are used.
+and only for `flathub/io.tether.QVAC.Workbench` on `refs/heads/master`. Code is
+taken from the trusted `master` commit; the `beta` checkout is data (read as
+text, never executed or YAML-parsed). The only credential is the job's
+`GITHUB_TOKEN` (`contents: write`, `pull-requests: write`); no secrets are used.
 
-`update_beta.py` (standard library only):
+`update_beta.py` (standard library only) has three subcommands:
+
+### `update`
 
 1. Lists `https://static.tether.dev/qv.ac/` (the same listing the production
    checker reads) and keeps `beta-X.Y.Z-rc.N.B/` directories. The newest by
    numeric order wins (`rc.10` > `rc.9`); `beta/`, `latest/` and stable
    `X.Y.Z/` are ignored, so stable discovery is untouched.
 2. Does nothing (exit 0) when that version is already in beta (`duplicate`),
-   older than beta (`older`), already has an updater PR (`proposed`), is not
-   listed (`no-publication`), or any required file is still missing
+   older than beta (`older`), already has a trusted updater PR (`proposed`), is
+   not listed (`no-publication`), or any required file is still missing
    (`incomplete`, retried next run). Only the newest version is considered.
 3. Verifies `beta-<v>/flatpak/` for x64 and arm64: `QV.AC-<arch>-flatpak.tar.gz.sha512`
    is `<sha512>  <name>` and `io.tether.qvac.source-<arch>.yml` is the canonical
@@ -39,9 +42,52 @@ YAML-parsed). The only credential is the job's `GITHUB_TOKEN`
 (runtime, wrapper and everything else unchanged). Afterwards the base is the
 beta manifest itself, so beta-only human edits survive.
 
-The workflow commits only the manifest to `beta-update/<version>`, opens a PR
-to `beta`, closes older open `beta-update/*` PRs, and always uploads the diff as
-a `beta-update-<version>` artifact.
+### `proposals`: which pull requests count
+
+Before `update`, the workflow reads the newest 100 pull requests into `beta`
+(`gh api repos/<repo>/pulls`, GET only) and `proposals` keeps the versions that
+already have one. A pull request counts, in any state (open, closed or merged),
+only if all of these hold:
+
+- its head branch is `beta-update/<X.Y.Z-rc.N.B>` in **this repository**
+  (`head.repo.full_name`), so never a fork, including a closed or deleted one;
+- it targets `beta`;
+- its author is `github-actions[bot]` (`user.login`, `user.type == "Bot"`, and
+  id `41898282`), which is who `GITHUB_TOKEN` pull requests are authored by.
+
+A fork, a human on a same-prefix branch, or another bot can neither suppress an
+update nor be touched by it. REST objects are used rather than `gh pr list
+--json author` because the REST `user` format is documented and the gh CLI's
+rendering of bot logins could not be verified offline. A closed bot PR still
+counts, so a version a maintainer declined is not proposed again; the next RC
+gets a new PR.
+
+### `plan-branch`: branch handling and crash retries
+
+After a verified update the workflow runs `plan-branch`, which stages only the
+manifest and inspects `beta-update/<version>` on the remote:
+
+- **absent:** prints `create`; the workflow commits and pushes it (never forced).
+- **present and exactly the verified update**, meaning one commit whose parent is
+  the current `beta` head and whose tree equals the verified manifest: prints
+  `reuse`. This is a retry after a crash between push and PR creation; the PR
+  body and patch are built from that same verified manifest, so they describe the
+  actual branch.
+- **present but anything else** (other content, extra commits, a different or
+  older `beta` base, a merge): fails with the reason and repair steps. Nothing is
+  pushed, forced or rewritten. Inspect the branch, delete it
+  (`git push origin --delete beta-update/<version>`), and re-run.
+
+The pull request is opened only if no trusted PR exists for that exact head
+(looked up by head, so a flood of other PRs cannot hide it). The diff is always
+uploaded as a `beta-update-<version>` artifact.
+
+### Superseded pull requests
+
+Nothing is closed automatically. When a newer RC is proposed, close older
+updater PRs by hand. Both edit the same manifest lines, so GitHub normally
+reports a conflict on the second one merged instead of silently reverting beta.
+If a PR is closed rather than merged, that version is not proposed again.
 
 ## Operating
 
@@ -52,9 +98,10 @@ a `beta-update-<version>` artifact.
 - Run now: Actions > Beta updater > Run workflow. Choose `patch` to get only the
   artifact (no branch, no PR). Set the repository variable `BETA_UPDATER_MODE=patch`
   to make scheduled runs patch-only, e.g. if Flathub policy objects to bot PRs.
-- Local check, no writes: `python3 -I .github/beta-updater/update_beta.py --master io.tether.QVAC.Workbench.yml --beta-dir <beta checkout> --dry-run`
-- Tests (offline, no network, no real archive):
-  `python3 -I -m unittest discover -s .github/beta-updater/tests -v`
+- Local check, no writes: `python3 -I .github/beta-updater/update_beta.py update --master io.tether.QVAC.Workbench.yml --beta-dir <beta checkout> --dry-run`
+- Tests: `python3 -I -m unittest discover -s .github/beta-updater/tests -v`.
+  They need no network and download no real archive. The branch tests run real
+  `git` against throwaway local repositories and are skipped if `git` is missing.
 
 ## Contract with QVAC
 

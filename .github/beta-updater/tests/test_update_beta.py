@@ -11,8 +11,11 @@ import gzip
 import hashlib
 import importlib.util
 import io
+import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -36,6 +39,24 @@ APP_ID = ub.manifest_id(ub.split_manifest(MASTER.read_text(encoding="utf-8")))
 V1 = "0.21.0-rc.1.100"
 V2 = "0.21.0-rc.2.100"
 V10 = "0.21.0-rc.10.5"
+REPO_NAME = "flathub/io.tether.QVAC.Workbench"
+FORK = "someone/io.tether.QVAC.Workbench"
+BOT = {"login": "github-actions[bot]", "id": 41898282, "type": "Bot"}
+HUMAN = {"login": "octocat", "id": 583231, "type": "User"}
+
+
+def pull(version=V2, *, user=BOT, head_repo=REPO_NAME, base_ref="beta", state="open", ref=None):
+    """A GitHub REST pull request object carrying the fields the updater reads."""
+    return {
+        "number": 7,
+        "state": state,
+        "head": {
+            "ref": ref or f"beta-update/{version}",
+            "repo": None if head_repo is None else {"full_name": head_repo},
+        },
+        "base": {"ref": base_ref, "repo": {"full_name": REPO_NAME}},
+        "user": user,
+    }
 
 
 def base(version):
@@ -131,6 +152,7 @@ class UpdaterCase(unittest.TestCase):
 
     def run_main(self, fetcher, *extra):
         argv = [
+            "update",
             "--master", str(MASTER),
             "--beta-dir", str(self.beta),
             "--pr-body", str(self.root / "body.md"),
@@ -400,6 +422,7 @@ class CliTests(UpdaterCase):
         self.assertIn(hashlib.sha512(make_archive()).hexdigest(), body)
         self.assertIn("Human review and merge required", body)
         self.assertIn("never merges", body)
+        self.assertIn("never closed automatically", body)
         self.assertEqual(sorted(p.name for p in self.beta.iterdir()), [MASTER.name], "no stray temp files")
 
         (self.root / "out.txt").unlink()
@@ -444,6 +467,289 @@ class CliTests(UpdaterCase):
         self.assertEqual(fetcher.downloads, [])
 
 
+class ProposalTests(UpdaterCase):
+    def test_this_repos_actions_bot_counts_in_every_state(self):
+        pulls = [pull(V1, state="open"), pull(V2, state="closed"), pull(V10, state="closed")]
+        self.assertEqual(ub.trusted_proposals(pulls, REPO_NAME), {V1, V2, V10})
+        self.assertEqual(ub.trusted_proposals([pull(V1, head_repo=REPO_NAME.upper())], REPO_NAME), {V1})
+
+    def test_nothing_else_counts(self):
+        cases = {
+            "fork by a human": pull(head_repo=FORK, user=HUMAN),
+            "closed fork by a human": pull(head_repo=FORK, user=HUMAN, state="closed"),
+            "deleted fork": pull(head_repo=None, user=HUMAN, state="closed"),
+            "bot account on a fork": pull(head_repo=FORK),
+            "human on this repo with the same prefix": pull(user=HUMAN),
+            "closed human pull request on this repo": pull(user=HUMAN, state="closed"),
+            "user that only looks like the bot": pull(user={"login": BOT["login"], "id": 1, "type": "User"}),
+            "bot login without the suffix": pull(user={"login": "github-actions", "id": BOT["id"], "type": "Bot"}),
+            "right login, wrong id": pull(user={"login": BOT["login"], "id": 99, "type": "Bot"}),
+            "other bot": pull(user={"login": "dependabot[bot]", "id": 49699333, "type": "Bot"}),
+            "targets another base": pull(base_ref="master"),
+            "other branch prefix": pull(ref="update-master-4e59a0e"),
+            "branch with an invalid version": pull(ref="beta-update/0.21.0-rc.2"),
+            "no author": {**pull(), "user": None},
+            "not an object": "beta-update/" + V2,
+        }
+        for label, case in cases.items():
+            with self.subTest(label):
+                self.assertEqual(ub.trusted_proposals([case], REPO_NAME), set())
+
+    def test_untrusted_pulls_never_hide_or_replace_a_trusted_one(self):
+        untrusted = [
+            pull(V2, head_repo=FORK, user=HUMAN),
+            pull(V2, head_repo=None, user=HUMAN, state="closed"),
+            pull(V2, user=HUMAN),
+        ]
+        self.assertEqual(ub.trusted_proposals(untrusted, REPO_NAME), set())
+        self.assertEqual(ub.trusted_proposals([*untrusted, pull(V2)], REPO_NAME), {V2})
+
+    def test_untrusted_pulls_do_not_suppress_the_verified_update(self):
+        untrusted = [
+            pull(V2, head_repo=FORK, user=HUMAN),
+            pull(V2, head_repo=None, user=HUMAN, state="closed"),
+            pull(V2, user=HUMAN, state="closed"),
+        ]
+        fetcher = site([f"beta-{V2}"], [V2])
+        outcome = self.propose(fetcher, proposed=ub.trusted_proposals(untrusted, REPO_NAME))
+        self.assertEqual(outcome.reason, "bootstrap")
+        self.assertEqual(len(fetcher.downloads), 1)
+
+    def test_a_trusted_pull_suppresses_the_update_even_when_closed(self):
+        for state in ("open", "closed"):
+            with self.subTest(state):
+                fetcher = site([f"beta-{V2}"], [V2])
+                outcome = self.propose(fetcher, proposed=ub.trusted_proposals([pull(V2, state=state)], REPO_NAME))
+                self.assertEqual(outcome.reason, "proposed")
+                self.assertEqual(fetcher.downloads, [])
+
+    def test_a_pull_for_another_version_does_not_suppress_the_newest(self):
+        fetcher = site([f"beta-{V1}", f"beta-{V2}"], [V2])
+        outcome = self.propose(fetcher, proposed=ub.trusted_proposals([pull(V1)], REPO_NAME))
+        self.assertEqual((outcome.reason, outcome.version), ("bootstrap", V2))
+
+    def test_malformed_pull_lists_are_rejected(self):
+        for text in ("not json", '{"head": {}}', "[" * 100000):
+            with self.subTest(text[:12]), self.assertRaises(ub.UpdateError):
+                ub.parse_pulls(text)
+        self.assertEqual(ub.parse_pulls("[]"), [])
+
+    def run_cli(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = ub.main(list(argv))
+        return code, out.getvalue(), err.getvalue()
+
+    def test_proposals_command_prints_trusted_versions_in_numeric_order(self):
+        pulls = self.root / "pulls.json"
+        pulls.write_text(
+            json.dumps([pull(V10), pull(V2), pull(V1, head_repo=FORK, user=HUMAN), pull(V1, user=HUMAN)]),
+            encoding="utf-8",
+        )
+        code, out, err = self.run_cli("proposals", "--pulls", str(pulls), "--repo", REPO_NAME)
+        self.assertEqual((code, out, err), (0, f"{V2}\n{V10}\n", ""))
+
+    def test_proposals_command_fails_closed_on_bad_input(self):
+        pulls = self.root / "pulls.json"
+        pulls.write_text("<html>rate limited</html>", encoding="utf-8")
+        code, out, err = self.run_cli("proposals", "--pulls", str(pulls), "--repo", REPO_NAME)
+        self.assertEqual((code, out), (1, ""))
+        self.assertTrue(err.startswith("error:"))
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            self.run_cli("proposals", "--pulls", str(pulls), "--repo", "not a repo")
+
+
+class BranchDecisionTests(unittest.TestCase):
+    BRANCH = f"beta-update/{V2}"
+    BASE, TREE, TIP, OTHER = "a" * 40, "b" * 40, "c" * 40, "d" * 40
+
+    def check(self, tip_line, tip_tree=None):
+        return ub.check_branch(self.BRANCH, self.BASE, self.TREE, self.TIP, tip_line, tip_tree or self.TREE)
+
+    def test_exactly_the_verified_update_on_the_current_beta_head_is_reused(self):
+        self.assertEqual(self.check(f"{self.TIP} {self.BASE}"), "reuse")
+
+    def test_anything_else_fails_with_repair_steps_and_no_force(self):
+        cases = {
+            "extra commit on top": (f"{self.TIP} {self.OTHER}", None),
+            "beta moved on": (f"{self.TIP} {self.OTHER}", self.TREE),
+            "root commit": (self.TIP, None),
+            "merge commit": (f"{self.TIP} {self.BASE} {self.OTHER}", None),
+            "different content": (f"{self.TIP} {self.BASE}", self.OTHER),
+            "both": (f"{self.TIP} {self.OTHER}", self.OTHER),
+        }
+        for label, (line, tree) in cases.items():
+            with self.subTest(label), self.assertRaises(ub.UpdateError) as raised:
+                self.check(line, tree)
+            message = str(raised.exception)
+            self.assertIn(self.BRANCH, message)
+            self.assertIn(f"git push origin --delete {self.BRANCH}", message)
+            self.assertIn("Repair", message)
+            self.assertNotIn("force", message)
+
+    def test_unexpected_git_output_is_an_error(self):
+        for line in ("", f"{self.OTHER} {self.BASE}", f"{self.TIP} zz", f"{self.TIP} {'a' * 7}"):
+            with self.subTest(line), self.assertRaisesRegex(ub.UpdateError, "unexpected git output"):
+                self.check(line)
+
+    def test_only_update_branch_names_are_accepted(self):
+        for name in ("beta", "beta-update/", "beta-update/0.21.0-rc.2", "../beta-update/" + V2):
+            with self.subTest(name), self.assertRaises(ub.UpdateError):
+                ub.check_branch(name, self.BASE, self.TREE, self.TIP, f"{self.TIP} {self.BASE}", self.TREE)
+
+    def test_only_the_exact_remote_ref_counts(self):
+        calls = []
+        # ls-remote patterns match by tail, so a longer ref can be listed for our branch name.
+        answers = {
+            "rev-parse": self.BASE,
+            "write-tree": self.TREE,
+            "ls-remote": f"{self.OTHER}\trefs/heads/other/{self.BRANCH}",
+        }
+
+        def fake_git(*args):
+            calls.append(args[0])
+            return answers.get(args[0], "")
+
+        self.assertEqual(ub.plan_branch("unused", "manifest.yml", self.BRANCH, git=fake_git), "create")
+        self.assertNotIn("fetch", calls)
+
+
+GIT_ENV = {
+    "GIT_AUTHOR_NAME": "Test",
+    "GIT_AUTHOR_EMAIL": "test@example.invalid",
+    "GIT_COMMITTER_NAME": "Test",
+    "GIT_COMMITTER_EMAIL": "test@example.invalid",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_TERMINAL_PROMPT": "0",
+}
+
+
+@unittest.skipUnless(shutil.which("git"), "git is not installed")
+class GitBranchTests(unittest.TestCase):
+    """plan_branch against real local repositories: an `origin` and shallow clones of its beta."""
+
+    BRANCH = f"beta-update/{V2}"
+    NAME = "manifest.yml"
+
+    def setUp(self):
+        environment = mock.patch.dict(os.environ, GIT_ENV)
+        environment.start()
+        self.addCleanup(environment.stop)
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        self.root = Path(scratch.name)
+        self.origin = self.root / "origin.git"
+        self.git(self.root, "init", "-q", "--bare", str(self.origin))
+        self.seed = self.root / "seed"
+        self.git(self.root, "init", "-q", str(self.seed))
+        self.git(self.seed, "checkout", "-q", "-b", "beta")
+        (self.seed / self.NAME).write_text("old\n", encoding="utf-8")
+        (self.seed / "flathub.json").write_text("{}\n", encoding="utf-8")
+        self.git(self.seed, "add", "-A")
+        self.git(self.seed, "commit", "-q", "-m", "seed")
+        self.git(self.seed, "remote", "add", "origin", str(self.origin))
+        self.git(self.seed, "push", "-q", "origin", "beta")
+
+    def git(self, cwd, *args):
+        result = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, f"git {' '.join(args)}: {result.stderr}")
+        return result.stdout.strip()
+
+    def clone(self, name):
+        destination = self.root / name
+        self.git(self.root, "clone", "-q", "--depth", "1", "--branch", "beta", self.origin.as_uri(), str(destination))
+        return destination
+
+    def plan(self, clone, text, branch=None):
+        (clone / self.NAME).write_text(text, encoding="utf-8")
+        return ub.plan_branch(str(clone), self.NAME, branch or self.BRANCH)
+
+    def commit_and_push(self, clone, branch=None):
+        """What the workflow does after a 'create' plan."""
+        branch = branch or self.BRANCH
+        self.git(clone, "switch", "-q", "-c", branch)
+        self.git(clone, "commit", "-q", "-m", "update")
+        self.git(clone, "push", "-q", "origin", f"HEAD:refs/heads/{branch}")
+
+    def remote_tip(self, branch=None):
+        return self.git(self.origin, "rev-parse", f"refs/heads/{branch or self.BRANCH}")
+
+    def publish(self, text="new\n"):
+        first = self.clone("first")
+        self.assertEqual(self.plan(first, text), "create")
+        self.commit_and_push(first)
+        return first, self.remote_tip()
+
+    def test_first_run_stages_only_the_manifest_and_asks_to_create(self):
+        clone = self.clone("first")
+        self.assertEqual(self.plan(clone, "new\n"), "create")
+        self.assertEqual(self.git(clone, "diff", "--cached", "--name-only"), self.NAME)
+
+    def test_retry_after_a_crash_reuses_the_branch_without_touching_it(self):
+        _, tip = self.publish()  # the crash happens here: pushed, but no PR was opened
+        self.assertEqual(self.plan(self.clone("retry"), "new\n"), "reuse")
+        self.assertEqual(self.remote_tip(), tip)
+
+    def test_other_versions_do_not_interfere(self):
+        self.publish()
+        self.assertEqual(self.plan(self.clone("other"), "new\n", f"beta-update/{V10}"), "create")
+
+    def test_branch_with_other_content_is_refused_and_left_alone(self):
+        _, tip = self.publish("new\n")
+        with self.assertRaisesRegex(ub.UpdateError, "does not contain exactly the verified update") as raised:
+            self.plan(self.clone("retry"), "newer\n")
+        self.assertIn(f"git push origin --delete {self.BRANCH}", str(raised.exception))
+        self.assertEqual(self.remote_tip(), tip)
+
+    def test_branch_with_extra_history_is_refused_even_if_the_content_matches(self):
+        first, _ = self.publish()
+        self.git(first, "commit", "-q", "--allow-empty", "-m", "noop")
+        self.git(first, "push", "-q", "origin", f"HEAD:refs/heads/{self.BRANCH}")
+        tip = self.remote_tip()
+        with self.assertRaisesRegex(ub.UpdateError, "not exactly one commit on the current beta head"):
+            self.plan(self.clone("retry"), "new\n")
+        self.assertEqual(self.remote_tip(), tip)
+
+    def test_branch_based_on_an_older_beta_is_refused(self):
+        _, tip = self.publish()
+        (self.seed / "flathub.json").write_text('{"only-arches": ["x86_64"]}\n', encoding="utf-8")
+        self.git(self.seed, "commit", "-q", "-am", "beta moved on")
+        self.git(self.seed, "push", "-q", "origin", "beta")
+        with self.assertRaisesRegex(ub.UpdateError, "current beta head"):
+            self.plan(self.clone("retry"), "new\n")
+        self.assertEqual(self.remote_tip(), tip)
+
+    def test_git_failures_are_update_errors(self):
+        with self.assertRaisesRegex(ub.UpdateError, "git add failed"):
+            ub.plan_branch(str(self.root / "missing"), self.NAME, self.BRANCH)
+
+    def test_cli_prints_the_plan_and_fails_closed(self):
+        argv = ["plan-branch", "--manifest", self.NAME, "--branch", self.BRANCH]
+        first = self.clone("first")
+        (first / self.NAME).write_text("new\n", encoding="utf-8")
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(ub.main([*argv, "--beta-dir", str(first)]), 0)
+        self.assertEqual(out.getvalue(), "create\n")
+        self.commit_and_push(first)
+
+        retry = self.clone("retry")
+        (retry / self.NAME).write_text("new\n", encoding="utf-8")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(ub.main([*argv, "--beta-dir", str(retry)]), 0)
+        self.assertEqual(out.getvalue(), "reuse\n")
+
+        changed = self.clone("changed")
+        (changed / self.NAME).write_text("newer\n", encoding="utf-8")
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(ub.main([*argv, "--beta-dir", str(changed)]), 1)
+        self.assertEqual(out.getvalue(), "")
+        self.assertIn("Repair", err.getvalue())
+
+
 class WorkflowContractTests(unittest.TestCase):
     def setUp(self):
         self.text = (WORKFLOWS / "beta-updater.yml").read_text(encoding="utf-8")
@@ -453,16 +759,22 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertRegex(self.text, r"(?m)^  workflow_dispatch:$")
         self.assertNotRegex(self.text, r"(?m)^  (push|pull_request\w*|workflow_run|repository_dispatch|issue_comment):")
 
-    def test_runs_only_from_the_default_branch_of_the_flathub_repo(self):
+    def test_runs_only_from_master_of_the_flathub_repo(self):
         self.assertIn("github.repository == 'flathub/io.tether.QVAC.Workbench'", self.text)
-        self.assertIn("github.ref == format('refs/heads/{0}', github.event.repository.default_branch)", self.text)
+        self.assertIn("github.ref == 'refs/heads/master'", self.text)
+        self.assertNotIn("default_branch", self.text, "the guard must not depend on the event payload shape")
 
     def test_code_is_trusted_and_beta_is_data(self):
         self.assertIn("ref: ${{ github.sha }}\n          path: trusted", self.text)
         self.assertIn("ref: beta\n          path: beta", self.text)
         self.assertEqual(self.text.count("persist-credentials: false"), 2)
-        interpreters = re.findall(r"python3 (\S+) (\S+)", self.text)
-        self.assertEqual(interpreters, [("-I", "trusted/.github/beta-updater/update_beta.py")])
+        interpreters = re.findall(r"python3 (\S+) (\S+) (\S+)", self.text)
+        self.assertEqual(
+            [command for *_, command in interpreters],
+            ["proposals", "update", "plan-branch", "proposals"],
+        )
+        for flag, script, _ in interpreters:
+            self.assertEqual((flag, script), ("-I", "trusted/.github/beta-updater/update_beta.py"))
         self.assertNotIn("git -C trusted", self.text)
         self.assertNotRegex(self.text, r"(?m)^\s*(bash|sh|source|\.|node|python3?)\s+(\./)?beta/")
 
@@ -473,15 +785,23 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertNotIn("secrets.", self.text)
         self.assertNotIn("id-token", self.text)
 
-    def test_never_merges(self):
-        for needle in ("pr merge", "--auto", "--admin", "auto-merge", "automerge", "AutoMerge", "gh api"):
+    def test_never_merges_and_never_closes(self):
+        for needle in ("pr merge", "pr close", "--auto", "--admin", "auto-merge", "automerge", "AutoMerge"):
             self.assertNotIn(needle, self.text)
         self.assertIn("gh pr create", self.text)
         self.assertIn("--base beta", self.text)
 
-    def test_only_the_beta_manifest_is_committed(self):
-        self.assertIn('git -C beta add -- "$MANIFEST"', self.text)
-        self.assertNotRegex(self.text, r"git -C beta add (-A|\.|--all)")
+    def test_gh_api_is_only_used_to_read_pull_requests(self):
+        calls = re.findall(r"(?m)^.*\bgh api\b.*$", self.text)
+        self.assertEqual(len(calls), 2)
+        for call in calls:
+            self.assertRegex(call, r'gh api "repos/\$GITHUB_REPOSITORY/pulls\?state=all&')
+            self.assertNotRegex(call, r"\s(-X|-f|-F|--method|--field|--raw-field|--input)(\s|=)")
+
+    def test_only_the_beta_manifest_is_staged_and_committed(self):
+        # plan-branch stages exactly --manifest (a test above proves that); nothing else is added.
+        self.assertIn('--manifest "$MANIFEST"', self.text)
+        self.assertNotRegex(self.text, r"git -C beta (add|commit -a|commit --all)")
 
     def test_actions_are_pinned_to_commits(self):
         for path in WORKFLOWS.glob("beta-updater*.yml"):

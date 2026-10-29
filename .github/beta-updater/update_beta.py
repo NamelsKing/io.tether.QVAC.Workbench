@@ -15,9 +15,11 @@ import gzip
 import hashlib
 import http.client
 import io
+import json
 import os
 import re
 import stat
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -32,16 +34,23 @@ ROOT_URL = f"https://{HOST}/qv.ac/"
 ARCHES = ("x64", "arm64")  # QVAC publishes both; the manifest only consumes x64
 MANIFEST_ARCH = "x64"
 BRANCH_PREFIX = "beta-update/"
+# Pull requests opened with the job's GITHUB_TOKEN are authored by this account (REST `user`).
+BOT_LOGIN = "github-actions[bot]"
+BOT_ID = 41898282
 
 NUMBER = r"(?:0|[1-9]\d{0,8})"
 VERSION = rf"{NUMBER}\.{NUMBER}\.{NUMBER}-rc\.{NUMBER}\.{NUMBER}"
 LISTING_RE = re.compile(rf'href="\./beta-({VERSION})/"')
+BRANCH_RE = re.compile(rf"{re.escape(BRANCH_PREFIX)}({VERSION})")
+SHA = r"(?:[0-9a-f]{40}|[0-9a-f]{64})"
 STAGING_URL = rf"https://{re.escape(HOST)}/qv\.ac/beta-({VERSION})/flatpak/QV\.AC-{MANIFEST_ARCH}-flatpak\.tar\.gz"
 
 MAX_LISTING = 1 << 20
 MAX_METADATA = 4096
 MAX_MANIFEST = 256 << 10
 MAX_PROPOSED = 64 << 10
+MAX_PULLS = 32 << 20
+GIT_TIMEOUT = 120
 MAX_MEMBERS = 1_000_000
 DEFAULT_MAX_ARCHIVE = 3 << 30
 DEFAULT_TIME_BUDGET = 1200
@@ -309,7 +318,7 @@ def split_manifest(text):
 
 
 def manifest_id(lines):
-    found =[m.group(1) for m in (re.fullmatch(r"id: (\S+)\s*", line) for line in lines) if m]
+    found = [m.group(1) for m in (re.fullmatch(r"id: (\S+)\s*", line) for line in lines) if m]
     if len(found) != 1 or not re.fullmatch(r"[A-Za-z0-9_.-]+", found[0]):
         raise UpdateError("manifest must declare exactly one top-level id")
     return found[0]
@@ -405,7 +414,7 @@ def pr_body(version, digest, previous, bootstrap, master_rev):
             "- the archive lists the id-named files and `run.sh` the manifest installs (names only, nothing extracted or executed).",
             "",
             "Human review and merge required. The updater never merges and never enables auto-merge.",
-            "Older open updater PRs are closed when a newer one is opened. See `.github/beta-updater/README.md` on `master`.",
+            "Updater PRs are never closed automatically: close any older, superseded one by hand. See `.github/beta-updater/README.md` on `master`.",
             "",
         ]
     )
@@ -486,6 +495,115 @@ def read_proposed(path):
     return frozenset(line.strip() for line in text.split("\n") if re.fullmatch(VERSION, line.strip()))
 
 
+# --- existing pull requests and update branches ---
+
+
+def parse_pulls(text):
+    try:
+        pulls = json.loads(text)
+    except (ValueError, RecursionError) as error:
+        raise UpdateError("pull request list is not valid JSON") from error
+    if not isinstance(pulls, list):
+        raise UpdateError("pull request list is not a JSON array")
+    return pulls
+
+
+def _field(value, *path):
+    for key in path:
+        value = value.get(key) if isinstance(value, dict) else None
+    return value
+
+
+def trusted_proposals(pulls, repo):
+    """Versions that already have an updater pull request opened by this repository's Actions bot.
+
+    `pulls` are GitHub REST pull request objects. One counts, in any state, only when its head
+    branch lives in `repo` itself (so never a fork, including a deleted one), it targets beta and
+    its author is github-actions[bot]. A fork, or a human reusing the branch prefix, can neither
+    suppress an update nor be mistaken for one.
+    """
+    versions = set()
+    for pull in pulls:
+        ref = _field(pull, "head", "ref")
+        head_repo = _field(pull, "head", "repo", "full_name")
+        match = BRANCH_RE.fullmatch(ref) if isinstance(ref, str) else None
+        if (
+            match
+            and _field(pull, "base", "ref") == "beta"
+            and isinstance(head_repo, str)
+            and head_repo.lower() == repo.lower()
+            and _field(pull, "user", "login") == BOT_LOGIN
+            and _field(pull, "user", "type") == "Bot"
+            and _field(pull, "user", "id") == BOT_ID
+        ):
+            versions.add(match.group(1))
+    return versions
+
+
+def check_branch(branch, base, tree, tip, tip_line, tip_tree):
+    """Allow reusing an existing remote update branch only if it is exactly the verified update.
+
+    That means a single commit on the current beta head (`base`) whose tree is the tree the
+    verified manifest produces (`tree`), so the PR body and patch describe the actual branch.
+    Anything else fails with repair steps; nothing is ever force-pushed or rewritten.
+    `tip_line` is `git rev-list --parents -n 1 <tip>`.
+    """
+    if not BRANCH_RE.fullmatch(branch):
+        raise UpdateError(f"not an update branch name: {clean(branch, 80)}")
+    words = tip_line.split()
+    if not words or words[0] != tip or not all(re.fullmatch(SHA, w) for w in [base, tree, tip_tree, *words]):
+        raise UpdateError("unexpected git output while inspecting the existing update branch")
+    problems = []
+    if words[1:] != [base]:
+        problems.append(f"is not exactly one commit on the current beta head {base[:12]}")
+    if tip_tree != tree:
+        problems.append("does not contain exactly the verified update")
+    if problems:
+        raise UpdateError(
+            f"remote branch {branch} already exists but {' and '.join(problems)}; refusing to push over it. "
+            f"Repair: inspect it, delete it with 'git push origin --delete {branch}', then re-run"
+        )
+    return "reuse"
+
+
+def run_git(beta_dir, *args):
+    try:
+        result = subprocess.run(
+            ["git", "-C", beta_dir, *args],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=GIT_TIMEOUT,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise UpdateError(f"git {args[0]} could not run: {type(error).__name__}") from error
+    if result.returncode != 0:
+        raise UpdateError(f"git {args[0]} failed: {clean(result.stderr.strip(), 200)}")
+    return result.stdout.strip()
+
+
+def plan_branch(beta_dir, manifest, branch, git=None):
+    """Return 'create' when the update branch does not exist yet, 'reuse' when it already is
+    exactly the verified update (a retry after a crash), and raise otherwise.
+
+    Stages `manifest` in the beta checkout, so the expected tree is the one the commit gets.
+    """
+    git = git or (lambda *args: run_git(beta_dir, *args))
+    if not BRANCH_RE.fullmatch(branch) or not re.fullmatch(r"[A-Za-z0-9_.-]+", manifest):
+        raise UpdateError("invalid branch or manifest name")
+    git("add", "--", manifest)
+    base = git("rev-parse", "HEAD")
+    tree = git("write-tree")
+    ref = f"refs/heads/{branch}"
+    tips = [sha for sha, _, name in (line.partition("\t") for line in git("ls-remote", "origin", ref).splitlines()) if name == ref]
+    if not tips:
+        return "create"
+    git("fetch", "--no-tags", "--depth=2", "origin", ref)
+    tip = git("rev-parse", "FETCH_HEAD")
+    return check_branch(branch, base, tree, tip, git("rev-list", "--parents", "-n", "1", tip), git("rev-parse", f"{tip}^{{tree}}"))
+
+
 def write_atomic(path, text):
     """Write via a temp file and rename, so a symlink at path is replaced, not followed."""
     handle, temporary = tempfile.mkstemp(dir=os.path.dirname(path) or ".", prefix=".update-beta-")
@@ -524,44 +642,55 @@ def summarize(outcome):
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--master", required=True, help="trusted production manifest (read only)")
-    parser.add_argument("--beta-dir", required=True, help="beta checkout; only the manifest file in it is written")
-    parser.add_argument("--proposed", help="file listing versions that already have an updater PR")
-    parser.add_argument("--pr-body", help="where to write the pull request body")
-    parser.add_argument("--master-rev", help="40-hex commit of the trusted master checkout")
-    parser.add_argument("--github-output", help="GITHUB_OUTPUT file to append changed/reason/version/branch to")
-    parser.add_argument("--summary", help="file (GITHUB_STEP_SUMMARY) to append a one-line result to")
-    parser.add_argument("--max-archive-bytes", type=int, default=DEFAULT_MAX_ARCHIVE)
-    parser.add_argument("--time-budget", type=int, default=DEFAULT_TIME_BUDGET, help="seconds for all network and unpacking")
-    parser.add_argument("--dry-run", action="store_true", help="verify and report, write nothing but outputs/summary")
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    update = commands.add_parser("update", help="verify the newest staging publication and rewrite the beta manifest")
+    update.add_argument("--master", required=True, help="trusted production manifest (read only)")
+    update.add_argument("--beta-dir", required=True, help="beta checkout; only the manifest file in it is written")
+    update.add_argument("--proposed", help="file listing versions that already have a trusted updater PR (see proposals)")
+    update.add_argument("--pr-body", help="where to write the pull request body")
+    update.add_argument("--master-rev", help="40-hex commit of the trusted master checkout")
+    update.add_argument("--github-output", help="GITHUB_OUTPUT file to append changed/reason/version/branch to")
+    update.add_argument("--summary", help="file (GITHUB_STEP_SUMMARY) to append a one-line result to")
+    update.add_argument("--max-archive-bytes", type=int, default=DEFAULT_MAX_ARCHIVE)
+    update.add_argument("--time-budget", type=int, default=DEFAULT_TIME_BUDGET, help="seconds for all network and unpacking")
+    update.add_argument("--dry-run", action="store_true", help="verify and report, write nothing but outputs/summary")
+
+    proposals = commands.add_parser("proposals", help="print versions with a PR from this repository's Actions bot")
+    proposals.add_argument("--pulls", required=True, help="JSON array of REST pull request objects (gh api .../pulls)")
+    proposals.add_argument("--repo", required=True, help="OWNER/NAME of this repository")
+
+    plan = commands.add_parser("plan-branch", help="print create or reuse for the update branch, or fail with repair steps")
+    plan.add_argument("--beta-dir", required=True, help="beta checkout (its index is staged with the manifest)")
+    plan.add_argument("--manifest", required=True, help="manifest file name inside the beta checkout")
+    plan.add_argument("--branch", required=True, help="beta-update/<version>")
+
     args = parser.parse_args(argv)
-    if args.max_archive_bytes <= 0 or args.time_budget <= 0:
-        parser.error("--max-archive-bytes and --time-budget must be positive")
-    if args.master_rev and not re.fullmatch(r"[0-9a-f]{40}", args.master_rev):
-        parser.error("--master-rev must be a 40-hex commit")
+    if args.command == "update":
+        if args.max_archive_bytes <= 0 or args.time_budget <= 0:
+            parser.error("--max-archive-bytes and --time-budget must be positive")
+        if args.master_rev and not re.fullmatch(r"[0-9a-f]{40}", args.master_rev):
+            parser.error("--master-rev must be a 40-hex commit")
+    elif args.command == "proposals" and not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", args.repo):
+        parser.error("--repo must be OWNER/NAME")
     return args
 
 
-def main(argv=None, fetcher=None):
-    args = parse_args(argv)
+def cmd_update(args, fetcher):
     deadline = Deadline(args.time_budget)
-    try:
-        outcome = propose(
-            args.master,
-            args.beta_dir,
-            fetcher or HttpFetcher(deadline),
-            deadline,
-            proposed=read_proposed(args.proposed),
-            max_archive_bytes=args.max_archive_bytes,
-            master_rev=args.master_rev,
-        )
-        if outcome.changed and not args.dry_run:
-            write_atomic(outcome.manifest_path, outcome.manifest)
-            if args.pr_body:
-                write_atomic(args.pr_body, outcome.body)
-    except UpdateError as error:
-        print(clean(f"error: {error}"), file=sys.stderr)
-        return 1
+    outcome = propose(
+        args.master,
+        args.beta_dir,
+        fetcher or HttpFetcher(deadline),
+        deadline,
+        proposed=read_proposed(args.proposed),
+        max_archive_bytes=args.max_archive_bytes,
+        master_rev=args.master_rev,
+    )
+    if outcome.changed and not args.dry_run:
+        write_atomic(outcome.manifest_path, outcome.manifest)
+        if args.pr_body:
+            write_atomic(args.pr_body, outcome.body)
     line = summarize(outcome)
     print(line)
     if args.github_output:
@@ -570,6 +699,23 @@ def main(argv=None, fetcher=None):
         with open(args.summary, "a", encoding="utf-8") as handle:
             handle.write(f"### Beta updater\n\n{line}\n")
     return 0
+
+
+def main(argv=None, fetcher=None):
+    args = parse_args(argv)
+    try:
+        if args.command == "proposals":
+            pulls = parse_pulls(read_regular(args.pulls, MAX_PULLS))
+            for version in sorted(trusted_proposals(pulls, args.repo), key=version_key):
+                print(version)
+            return 0
+        if args.command == "plan-branch":
+            print(plan_branch(args.beta_dir, args.manifest, args.branch))
+            return 0
+        return cmd_update(args, fetcher)
+    except UpdateError as error:
+        print(clean(f"error: {error}", 600), file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
