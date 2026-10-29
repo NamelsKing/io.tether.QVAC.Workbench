@@ -78,9 +78,21 @@ manifest and inspects `beta-update/<version>` on the remote:
   pushed, forced or rewritten. Inspect the branch, delete it
   (`git push origin --delete beta-update/<version>`), and re-run.
 
-The pull request is opened only if no trusted PR exists for that exact head
-(looked up by head, so a flood of other PRs cannot hide it). The diff is always
-uploaded as a `beta-update-<version>` artifact.
+The pull request is opened only if no pull request exists on that exact head
+(looked up by head, so a flood of other PRs cannot hide it). This second lookup
+is `proposals --verified-head <branch>` and is deliberately looser than the bulk
+filter above: it counts any author, open or closed, but only a PR whose head is
+that exact `beta-update/<strict version>` branch in **this repository** and that
+targets `beta`. A fork with the same branch name never counts, since
+`head.repo.full_name` differs. Ignoring the author is sound only here, after
+`plan-branch` has verified the branch tip is exactly the verified update on the
+current `beta` head: a PR on that head, whoever opened it, proposes or declines
+that very content. So a maintainer who opens the PR by hand after a failed bot
+run is not duplicated, and one who closes it to decline is not overridden. The
+bulk filter stays bot-only because nothing is verified when it runs; a manual PR
+is therefore invisible to it, and scheduled runs keep re-verifying that version
+(including the x64 download) without opening anything until the next RC. The
+diff is always uploaded as a `beta-update-<version>` artifact.
 
 ### Superseded pull requests
 

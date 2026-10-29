@@ -558,6 +558,89 @@ class ProposalTests(UpdaterCase):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             self.run_cli("proposals", "--pulls", str(pulls), "--repo", "not a repo")
 
+    def test_verified_head_counts_any_author_in_any_state_on_the_exact_head(self):
+        branch = f"beta-update/{V2}"
+        cases = {
+            "human, open": pull(V2, user=HUMAN),
+            "human, closed (a declined proposal)": pull(V2, user=HUMAN, state="closed"),
+            "bot, open": pull(V2),
+            "bot, closed": pull(V2, state="closed"),
+            "other bot": pull(V2, user={"login": "dependabot[bot]", "id": 49699333, "type": "Bot"}),
+            "no author": {**pull(V2), "user": None},
+            "repository name in another case": pull(V2, head_repo=REPO_NAME.upper()),
+        }
+        for label, case in cases.items():
+            with self.subTest(label):
+                self.assertEqual(ub.verified_head_proposals([case], REPO_NAME, branch), {V2})
+
+    def test_verified_head_ignores_other_heads_forks_and_other_bases(self):
+        branch = f"beta-update/{V2}"
+        cases = {
+            "another version's branch": pull(V1, user=HUMAN),
+            "fork with the same branch name, open": pull(V2, head_repo=FORK, user=HUMAN),
+            "fork with the same branch name, closed": pull(V2, head_repo=FORK, user=HUMAN, state="closed"),
+            "bot account on a fork": pull(V2, head_repo=FORK),
+            "deleted fork": pull(V2, head_repo=None, user=HUMAN, state="closed"),
+            "same branch into another base": pull(V2, base_ref="master", user=HUMAN),
+            "other prefix": pull(V2, ref=f"feature/{V2}", user=HUMAN),
+            "branch name that only starts like ours": pull(V2, ref=f"beta-update/{V2}-extra", user=HUMAN),
+            "not an object": "beta-update/" + V2,
+        }
+        for label, case in cases.items():
+            with self.subTest(label):
+                self.assertEqual(ub.verified_head_proposals([case], REPO_NAME, branch), set())
+
+    def test_verified_head_only_accepts_strict_update_branch_names(self):
+        names = (
+            "",
+            "beta",
+            "beta-update/",
+            "beta-update/0.21.0-rc.2",
+            "beta-update/0.21.0-rc.2.05",
+            f"beta-update/{V2}/x",
+            f"../beta-update/{V2}",
+            f"Beta-update/{V2}",
+        )
+        for name in names:
+            with self.subTest(name), self.assertRaises(ub.UpdateError):
+                ub.verified_head_proposals([pull(V2, user=HUMAN)], REPO_NAME, name)
+
+    def test_bulk_filter_stays_strict_while_the_exact_head_lookup_is_not(self):
+        pulls = [pull(V2, user=HUMAN), pull(V2, user=HUMAN, state="closed")]
+        self.assertEqual(ub.trusted_proposals(pulls, REPO_NAME), set())
+        self.assertEqual(ub.verified_head_proposals(pulls, REPO_NAME, f"beta-update/{V2}"), {V2})
+
+    def test_manual_pull_after_a_failed_bot_run_is_neither_duplicated_nor_reproposed(self):
+        # The bot pushed the verified branch, PR creation failed, then a maintainer opened a PR
+        # on it by hand, and possibly closed it to decline.
+        for state in ("open", "closed"):
+            with self.subTest(state):
+                pulls = [pull(V2, user=HUMAN, state=state)]
+                outcome = self.propose(
+                    site([f"beta-{V2}"], [V2]), proposed=ub.trusted_proposals(pulls, REPO_NAME)
+                )
+                self.assertEqual(outcome.reason, "bootstrap", "the strict bulk list does not see it, so verification re-runs")
+                branch = ub.BRANCH_PREFIX + outcome.version
+                self.assertEqual(ub.verified_head_proposals(pulls, REPO_NAME, branch), {outcome.version})
+
+    def test_proposals_command_verified_head_mode(self):
+        branch = f"beta-update/{V2}"
+        pulls = self.root / "pulls.json"
+        pulls.write_text(
+            json.dumps([pull(V2, user=HUMAN, state="closed"), pull(V2, head_repo=FORK, user=HUMAN)]),
+            encoding="utf-8",
+        )
+        args = ("proposals", "--pulls", str(pulls), "--repo", REPO_NAME)
+        self.assertEqual(self.run_cli(*args), (0, "", ""), "bulk mode still ignores the human pull request")
+        self.assertEqual(self.run_cli(*args, "--verified-head", branch), (0, f"{V2}\n", ""))
+
+        pulls.write_text(json.dumps([pull(V2, head_repo=FORK, user=HUMAN), pull(V1, user=HUMAN)]), encoding="utf-8")
+        self.assertEqual(self.run_cli(*args, "--verified-head", branch), (0, "", ""))
+
+        code, out, err = self.run_cli(*args, "--verified-head", "beta-update/0.21.0-rc.2")
+        self.assertEqual((code, out), (1, ""))
+        self.assertTrue(err.startswith("error:"))
+
 
 class BranchDecisionTests(unittest.TestCase):
     BRANCH = f"beta-update/{V2}"
@@ -790,6 +873,13 @@ class WorkflowContractTests(unittest.TestCase):
             self.assertNotIn(needle, self.text)
         self.assertIn("gh pr create", self.text)
         self.assertIn("--base beta", self.text)
+
+    def test_only_the_lookup_after_plan_branch_uses_verified_head_mode(self):
+        invocations = re.findall(r"update_beta\.py proposals \\\n\s*(--pulls [^\n]*)", self.text)
+        self.assertEqual(len(invocations), 2)
+        self.assertNotIn("--verified-head", invocations[0], "the bulk list must stay strict")
+        self.assertIn('--verified-head "$BRANCH"', invocations[1])
+        self.assertLess(self.text.index("plan-branch"), self.text.index('--verified-head "$BRANCH"'))
 
     def test_gh_api_is_only_used_to_read_pull_requests(self):
         calls = re.findall(r"(?m)^.*\bgh api\b.*$", self.text)

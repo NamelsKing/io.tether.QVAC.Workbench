@@ -540,6 +540,33 @@ def trusted_proposals(pulls, repo):
     return versions
 
 
+def verified_head_proposals(pulls, repo, branch):
+    """Versions with a pull request on exactly `branch` in `repo` into beta, whoever opened it.
+
+    Narrow by construction: `branch` must be `beta-update/<strict version>` and the pull request's
+    head must be that very branch in `repo` itself (`head.repo.full_name`, so a fork with the same
+    branch name never counts), into beta, in any state. The author is deliberately ignored, and
+    that is only sound because it is called after `plan-branch` has verified the branch tip: by then
+    the branch is exactly the verified update on the current beta head, so a pull request on it, by
+    a maintainer after a failed bot run or closed to decline it, proposes or declines that very
+    content and must neither be duplicated nor re-proposed. The bulk filter, `trusted_proposals`,
+    stays strict because there nothing has been verified yet.
+    """
+    match = BRANCH_RE.fullmatch(branch)
+    if not match:
+        raise UpdateError(f"not an update branch name: {clean(branch, 80)}")
+    for pull in pulls:
+        head_repo = _field(pull, "head", "repo", "full_name")
+        if (
+            _field(pull, "head", "ref") == branch
+            and _field(pull, "base", "ref") == "beta"
+            and isinstance(head_repo, str)
+            and head_repo.lower() == repo.lower()
+        ):
+            return {match.group(1)}
+    return set()
+
+
 def check_branch(branch, base, tree, tip, tip_line, tip_tree):
     """Allow reusing an existing remote update branch only if it is exactly the verified update.
 
@@ -659,6 +686,11 @@ def parse_args(argv):
     proposals = commands.add_parser("proposals", help="print versions with a PR from this repository's Actions bot")
     proposals.add_argument("--pulls", required=True, help="JSON array of REST pull request objects (gh api .../pulls)")
     proposals.add_argument("--repo", required=True, help="OWNER/NAME of this repository")
+    proposals.add_argument(
+        "--verified-head",
+        metavar="BRANCH",
+        help="only after plan-branch verified BRANCH: print its version if a PR exists on that exact same-repo head, whoever opened it",
+    )
 
     plan = commands.add_parser("plan-branch", help="print create or reuse for the update branch, or fail with repair steps")
     plan.add_argument("--beta-dir", required=True, help="beta checkout (its index is staged with the manifest)")
@@ -706,7 +738,11 @@ def main(argv=None, fetcher=None):
     try:
         if args.command == "proposals":
             pulls = parse_pulls(read_regular(args.pulls, MAX_PULLS))
-            for version in sorted(trusted_proposals(pulls, args.repo), key=version_key):
+            if args.verified_head:
+                found = verified_head_proposals(pulls, args.repo, args.verified_head)
+            else:
+                found = trusted_proposals(pulls, args.repo)
+            for version in sorted(found, key=version_key):
                 print(version)
             return 0
         if args.command == "plan-branch":

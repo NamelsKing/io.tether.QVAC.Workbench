@@ -119,12 +119,13 @@ jobs:
           else
             echo "Branch $BRANCH already is exactly this verified update; reusing it."
           fi
-          # Opening is idempotent: look at this exact head, not just the newest pull requests.
+          # The branch is verified now, so any same-repo pull request on this exact head into
+          # beta counts, whoever opened it and open or closed (a maintainer's PR, or their decline).
           gh api "repos/$GITHUB_REPOSITORY/pulls?state=all&head=$GITHUB_REPOSITORY_OWNER:$BRANCH&per_page=100" > "$RUNNER_TEMP/branch-pulls.json"
           python3 -I trusted/.github/beta-updater/update_beta.py proposals \
-            --pulls "$RUNNER_TEMP/branch-pulls.json" --repo "$GITHUB_REPOSITORY" > "$RUNNER_TEMP/branch-proposed.txt"
+            --pulls "$RUNNER_TEMP/branch-pulls.json" --repo "$GITHUB_REPOSITORY" --verified-head "$BRANCH" > "$RUNNER_TEMP/branch-proposed.txt"
           if grep -qxF "$VERSION" "$RUNNER_TEMP/branch-proposed.txt"; then
-            echo "A trusted pull request for $VERSION already exists; nothing to open." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "A pull request on $BRANCH already exists (open or closed); nothing to open." | tee -a "$GITHUB_STEP_SUMMARY"
           else
             url="$(gh pr create --repo "$GITHUB_REPOSITORY" --base beta --head "$BRANCH" \
               --title "Update QV.AC beta to $VERSION" --body-file "$RUNNER_TEMP/pr-body.md")"
